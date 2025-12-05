@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PATPAT SCRAPER V2.0 - FIX & REPAIR
-- FIX: URL Structure (Added /en/sri-lanka/)
-- FIX: Selectors (Now uses Link-First detection to find ads even if layout changes)
+PATPAT SCRAPER V2.1 - SAVING FIX
+- FIX: Prevents Extractor threads from quitting early.
+- FIX: Forces 'Saved' count to sync with 'Found' count.
 """
 
 from __future__ import annotations
@@ -16,13 +16,11 @@ import logging
 import threading
 import requests
 import argparse
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any, List
 from tqdm import tqdm
 from bs4 import BeautifulSoup
-import psutil
 import re
 import csv
 
@@ -34,7 +32,6 @@ FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1"
 MAKES = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda',
          'daihatsu', 'kia', 'hyundai', 'micro', 'audi', 'bmw', 'mercedes-benz', 'land-rover', 'tata', 'mahindra']
 
-# Patpat URL slugs (singular)
 TYPES = ['car', 'van', 'suv', 'crew-cab', 'pickup', 'lorry', 'bus']
 
 MAX_PAGES_PER_COMBO = 50 
@@ -43,11 +40,6 @@ BATCH_SIZE = 20
 
 # 🛑 TUNING
 SESSION_TARGET_DEFAULT = 3
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
-]
-
 OUTPUT_FOLDER = "patpat_data_v2"
 CHECKPOINT_FILE = "patpat_progress.txt"
 SEEN_DB = "patpat_seen.sqlite"
@@ -165,7 +157,7 @@ class SessionManager:
                 if data.get("status") == "ok":
                     html = data.get("solution", {}).get("response", "")
         except: 
-            self._create(sid) # Re-create if crashed
+            self._create(sid) 
         
         self.pool.put(sid)
         return html
@@ -180,7 +172,8 @@ class SessionManager:
 # ---------------------------
 # 👷 WORKER LOGIC
 # ---------------------------
-ad_queue = queue.Queue(maxsize=500) 
+ad_queue = queue.Queue(maxsize=1000) 
+stop_event = threading.Event() # 🟢 KEY FIX: Controls worker life
 stats = {'found': 0, 'saved': 0, 'errors': 0}
 stats_lock = threading.Lock()
 
@@ -188,28 +181,20 @@ def harvest_task(make, v_type, page_num, cutoff, pool, ckpt, seen_db):
     task_id = f"{make}|{v_type}|{page_num}"
     if task_id in ckpt.completed: return 0
 
-    # 🟢 FIX 1: UPDATED URL STRUCTURE
-    # Was: patpat.lk/vehicle/... -> Now: patpat.lk/en/sri-lanka/vehicle/...
     url = f"https://patpat.lk/en/sri-lanka/vehicle/{v_type}/{make}"
     if page_num > 1: url += f"?page={page_num}"
 
     html = pool.fetch(url)
     if not html: return 0
-    if "No results found" in html: return 0 # Stop if empty page
+    if "No results found" in html: return 0
 
     soup = BeautifulSoup(html, "lxml")
     
-    # 🟢 FIX 2: ROBUST "MAGNET" SELECTOR
-    # Instead of looking for specific divs, we find ALL links that contain '/vehicle/' 
-    # and have a digit in the title (like a year).
-    
     links = []
-    # Find all 'a' tags with href
     all_a = soup.find_all('a', href=True)
     
     for a in all_a:
         href = a['href']
-        # Filter for actual ad links (usually contain make and id)
         if f"/vehicle/{v_type}/" in href or f"/{make}" in href:
              if len(href) > 20 and not "page=" in href:
                  links.append(a)
@@ -222,19 +207,14 @@ def harvest_task(make, v_type, page_num, cutoff, pool, ckpt, seen_db):
         if seen_db.seen(href): continue
         seen_db.mark(href)
 
-        # Try to find title/price from the link or its parent
         title = link.get_text(" ", strip=True)
         if len(title) < 5:
-            # Look up one level
             parent = link.find_parent()
             if parent: title = parent.get_text(" ", strip=True)
         
-        # Clean title
         title = title.replace("\n", " ").strip()[:100]
 
         item = {'url': href, 'date': "Check_Page", 'make': make, 'type': v_type, 'title': title, 'price': "0"}
-        
-        # Add to queue for detailed extraction
         ad_queue.put(item)
         count += 1
 
@@ -243,11 +223,12 @@ def harvest_task(make, v_type, page_num, cutoff, pool, ckpt, seen_db):
     return count
 
 def extractor_worker(bw, dw, cutoff, pool):
-    while True:
+    # 🟢 KEY FIX: Loop runs until stop_event is set AND queue is empty
+    while not stop_event.is_set() or not ad_queue.empty():
         try: 
-            item = ad_queue.get(timeout=5)
-        except: 
-            break
+            item = ad_queue.get(timeout=3)
+        except queue.Empty:
+            continue
 
         try:
             html = pool.fetch(item['url'])
@@ -256,7 +237,6 @@ def extractor_worker(bw, dw, cutoff, pool):
             soup = BeautifulSoup(html, "lxml")
             full_text = soup.get_text(" ", strip=True)
 
-            # Date Extraction
             dm = re.search(r'Posted on\s*[:|-]?\s*(\d{4}-\d{2}-\d{2})', full_text, re.IGNORECASE)
             if not dm: dm = re.search(r'(\d{4}-\d{2}-\d{2})', full_text)
             
@@ -270,20 +250,17 @@ def extractor_worker(bw, dw, cutoff, pool):
                     final_date = dm.group(1)
                 except: pass
             
-            # Price Extraction
             pm = re.search(r'(?:Rs|LKR)\.?\s*([\d,]+)', full_text, re.IGNORECASE)
             price = pm.group(1).replace(",", "") if pm else "0"
 
             details = {'YOM': '', 'Contact': '', 'Location': '', 'Mileage': ''}
             
-            # Find Phone (Look for tel: links first)
             tels = soup.find_all('a', href=re.compile(r'^tel:'))
             phones = [t['href'].replace('tel:', '') for t in tels]
             if not phones:
                 phones = re.findall(r'(?:07\d|0\d{2})[- ]?\d{3}[- ]?\d{4}', full_text)
             details['Contact'] = " / ".join(list(set(phones)))
 
-            # Generic Detail Extraction (Table/List scan)
             for li in soup.find_all(['li', 'tr', 'div']):
                 txt = li.get_text(" ", strip=True).lower()
                 if 'mileage' in txt and 'km' in txt: details['Mileage'] = txt
@@ -304,8 +281,8 @@ def main():
     parser.add_argument("--days", type=int, default=DAYS_TO_KEEP)
     args = parser.parse_args()
 
-    # Dynamic pool size
-    pool_size = 4
+    # 🟢 FORCE 6 Browsers for speed
+    pool_size = 6
     pool = SessionManager(pool_size)
     
     cutoff = datetime.now() - timedelta(days=args.days)
@@ -320,16 +297,14 @@ def main():
     ex_pool = ThreadPoolExecutor(max_workers=pool_size)
     for _ in range(pool_size): ex_pool.submit(extractor_worker, bw, None, cutoff, pool)
 
-    # Generate Tasks
     tasks = []
     for make in MAKES:
         for v_type in TYPES:
             for p in range(1, MAX_PAGES_PER_COMBO + 1): tasks.append((make, v_type, p))
     random.shuffle(tasks)
 
-    print(f"🚀 Started Patpat Scraper V2 (Tasks: {len(tasks)})")
+    print(f"🚀 Started Patpat Scraper V2.1 (Tasks: {len(tasks)})")
     
-    # Run Search
     with ThreadPoolExecutor(max_workers=pool_size) as s_pool:
         futures = [s_pool.submit(harvest_task, m, t, p, cutoff, pool, ckpt, seen) for (m, t, p) in tasks]
         with tqdm(total=len(futures)) as pbar:
@@ -337,7 +312,11 @@ def main():
                 pbar.update(1)
                 pbar.set_postfix(stats)
 
+    # 🟢 WAIT for queue to empty before stopping workers
     ad_queue.join()
+    stop_event.set() # Tell workers to go home
+    ex_pool.shutdown(wait=True)
+    
     bw.flush()
     pool.close()
     print("✅ Done.")
