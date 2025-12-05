@@ -43,11 +43,11 @@ jobs:
           pip install requests beautifulsoup4 lxml tqdm psutil
 
       - name: 🔑 Inject Secrets (Optional)
-        # This replaces the placeholder in your code with the real secret from GitHub
-        # Only needed if you use WhatsApp notifications
-        if: ${{ secrets.WHATSAPP_API_KEY != '' }}
+        # We handle the check inside the shell command to avoid the 'secrets' error
         run: |
-          sed -i "s/REPLACE_WITH_YOUR_KEY/${{ secrets.WHATSAPP_API_KEY }}/g" patpat_scraper.py
+          if [ -n "${{ secrets.WHATSAPP_API_KEY }}" ]; then
+            sed -i "s/REPLACE_WITH_YOUR_KEY/${{ secrets.WHATSAPP_API_KEY }}/g" patpat_scraper.py
+          fi
 
       - name: 🚀 Run Scraper
         env:
