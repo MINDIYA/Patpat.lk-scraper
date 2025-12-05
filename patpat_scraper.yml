@@ -1,0 +1,72 @@
+name: Patpat Scraper Bot
+
+on:
+  schedule:
+    # Runs every 6 hours (Adjust as needed)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allows you to click "Run" manually
+
+permissions:
+  contents: write # Required to save CSVs back to the repo
+
+jobs:
+  scrape-patpat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # Stop if it gets stuck for more than an hour
+
+    # 🟢 SERVICE: This runs FlareSolverr in the background automatically
+    services:
+      flaresolverr:
+        image: flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        # Set environment variables for FlareSolverr if needed (usually defaults are fine)
+        options: >-
+          --health-cmd "curl --fail http://localhost:8191/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Installing requirements based on your imports
+          pip install requests beautifulsoup4 lxml tqdm psutil
+
+      - name: 🔑 Inject Secrets (Optional)
+        # This replaces the placeholder in your code with the real secret from GitHub
+        # Only needed if you use WhatsApp notifications
+        if: ${{ secrets.WHATSAPP_API_KEY != '' }}
+        run: |
+          sed -i "s/REPLACE_WITH_YOUR_KEY/${{ secrets.WHATSAPP_API_KEY }}/g" patpat_scraper.py
+
+      - name: 🚀 Run Scraper
+        env:
+          # Ensure Python knows where to find FlareSolverr (Localhost works in GitHub Actions services)
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+        run: |
+          # Assumes your file is named 'patpat_scraper.py'
+          python patpat_scraper.py --days 15
+
+      - name: 💾 Commit and Push Data
+        run: |
+          git config --global user.name "Scraper Bot"
+          git config --global user.email "bot@github.com"
+          
+          # Add the CSV folder, the database, and the progress file
+          git add patpat_data_v1/
+          git add patpat_seen.sqlite
+          git add patpat_progress.txt
+          
+          # Commit if there are changes, otherwise exit gracefully
+          git commit -m "📈 Auto-update: Patpat Data [$(date)]" || exit 0
+          git push
